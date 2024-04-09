@@ -1,0 +1,413 @@
+---
+title: "Analyse des profils des hôtes"
+author: "CB"
+format: html
+editor: visual
+---
+
+Dans ce script on se concentre sur l'influence du profil des influenceurs sur leur performance qui peut être étudiées par deux indicateurs: le satisfaction et la fréquence des locations.
+
+La satisfaction est ici une double moyenne : moyenne des évaluations à travers plusieurs critères, et moyenne à travers les appartement gérées. Nous devrons prendre en compte très vite que si la très grande majorité des propriétaire ne proposent qu'un seul logement, une minorité en propose  deux, trois, quelques uns et même plusieurs dizaines. Une des questions clé de l'analyse de l'offre est son degré de professionnalisation, si une part importante des agents est motivée par l'opportunité, une autre part en a fait une sorte de métier. 
+
+
+On commence par l'analyse des noms d'offreurs.
+
+On s'attarde sur leurs origines
+
+# Packages et données
+
+## les packages
+
+```{r}
+library(tidyverse)
+library(ggwordcloud)
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textplots)
+#library(quanteda.corpora)
+library(gganimate)
+library(cowplot)
+library(jtools)
+library(interactions)
+library(MASS)
+
+
+col_sexe=c("purple", "orange")
+
+beigblue<-c("#4b3b42","#9c8481","#d9c2ba","#e2cbb0","#98aeb6")
+theme_set(theme_minimal())
+```
+
+## les données
+
+Dans cette étude on exploite les données de AirbnbInside et en particulier le fichier listing.
+
+```{r}
+
+listings<- read_csv("listingsdec2023.csv")
+
+listings<-listings %>%
+  dplyr::select(id, host_id, host_name, host_since, host_about, host_response_time,
+         host_response_rate, host_acceptance_rate, host_is_superhost,  host_listings_count, beds,
+         number_of_reviews,number_of_reviews_ltm, first_review, last_review, review_scores_rating, price)
+
+
+```
+
+# Présentation de soi
+
+
+## la langue 
+
+Les propriétaires, ou hôtes, peuvent se présenter ou non, et dans différentes langues, le français ou l'anglais, peut être d'autres langues. 
+
+Dans la    majorité des offres, le profil n'est pas indiqués, quand il l'est c'est plus en français qu'en anglais, mais nous devons être méfiants, une part des profils est en deux langues. Un traiment plus fin,  phrase à phrase,  est nécessaire pour quantifier la part de langage. 
+
+```{r}
+
+#detection de langue 
+
+library(cld3)
+
+listings<-listings %>% 
+  mutate(host_about = str_replace_all(host_about , "<br />", " "),
+         host_about = str_replace_all(host_about , "\n", " "),
+         host_about = str_replace_all(host_about , "\r", " "),
+         host_about = str_squish(host_about)
+         )%>%
+  mutate(price=as.numeric(str_sub(price, 2,nchar(price))))
+
+lang<-  detect_language(listings$host_about) #à faire sur une chaine plus longue
+
+listings<-cbind(listings,lang) 
+
+listings<-listings %>%
+  mutate(lang=ifelse(is.na(host_about), "ND",lang),
+         lang=ifelse(lang=="fr", "french",
+                       ifelse(lang=="en","english", "Autre")))%>%
+  mutate(lang=ifelse(is.na(host_about), "No presentation", lang)) 
+
+ggplot(listings, aes(x=lang))+
+         geom_bar(fill="#98aeb6")+
+         coord_flip()+
+  labs(x="langue", y="Nombre d'offres")
+
+```
+
+#  On aplique aux hosts
+
+le nombre de review à 3 mois peut être un indicateur de performance de même  que la note. On mène ici l'analyse au niveau de l'hôte , on va reprendra au niveau de l'appartement. 
+
+```{r}
+
+host<-listings %>%
+  group_by(host_id) %>%
+  summarise(host_name=first(host_name),
+            host_since=first(host_since),
+            host_about=first(host_about),
+            lang=first(lang),
+            n_log=n(),
+            host_listings_count=first(host_listings_count),
+            number_of_reviews_ltm= mean(number_of_reviews_ltm, na.rm=TRUE),
+            number_of_reviews= sum(number_of_reviews,na.rm=TRUE),
+            review_scores_rating=mean(review_scores_rating, na.rm=TRUE),
+            first_review=min(first_review),
+            last_review=max(last_review),
+            beds_sum=sum(beds, na.rm=TRUE),
+            beds_mean=mean(beds, na.rm=TRUE),
+            price=mean(price, na.rm=TRUE)
+            )%>%
+  mutate(n_log_cod=ifelse(n_log==1, "1 log.",
+                          ifelse(n_log==2,"2 log.",
+                              ifelse(n_log>2  & n_log<6, "3-5 log.",
+                                     ifelse(n_log>5, "6  log. et +", NA)))))%>%
+  mutate(year=year(host_since))
+
+
+#correlation
+foo<-host %>% 
+  dplyr::select(host_listings_count, n_log,beds_mean, beds_sum, number_of_reviews, number_of_reviews_ltm, year, price)%>%
+  drop_na()
+
+
+r<-cor(foo)  
+r
+library(ggcorrplot)
+ggcorrplot(r, hc.order = TRUE, type = "lower",
+   outline.col = "white",
+   colors = c("#98aeb6", "white", "#e2cbb0"),
+   lab = TRUE)
+
+
+```
+
+## des propriétaires multiples
+
+Le modèle de la mise en location d'un seul logement est encore dominant, plus de 90% des hôtes n'ont qu'un appartement à offrir sur le marché. Cependant les 10% qui en proposent 2, 3 quelques uns et parfois plusieurs dizaines, comptent pour un tiers des appartements proposés sur la plateforme. 
+
+```{r}
+foo<- host %>%
+  group_by(n_log_cod)%>%
+  summarise(n=n(),
+            nbr_logements=sum(n_log),
+            beds_mean=mean(beds_mean,na.rm=TRUE))
+
+total_lognt<-sum(foo$nbr_logements)
+total_host<-sum(foo$n)
+
+p2<-ggplot(foo,aes(x=n_log_cod, y=nbr_logements/total_lognt))+
+  geom_bar(stat="identity", fill="#d9c2ba")+
+  coord_flip()+
+    labs(title = "Distribution des logements",
+         x=NULL, y=NULL)+ scale_y_continuous(labels = scales::percent,breaks = seq(0, 1, .2))
+
+
+p1<-ggplot(foo,aes(x=n_log_cod, y=n/total_host))+
+  geom_bar(stat="identity", fill="#e2cbb0")+
+  coord_flip()+
+  labs(title = "Distribution des hôtes",
+       x=NULL, y=NULL)+ scale_y_continuous(labels = scales::percent,breaks = seq(0, 1, .2))
+  
+
+plot_grid(p1, p2, labels = c('A', 'B'), label_size = 12)
+
+
+```
+## Le nombre de logement
+
+```{r}
+ggplot(host, aes(x = price))+geom_histogram(binwidth = 20)#+scale_x_log10()
+
+foo<-host %>%
+  group_by(n_log_cod)%>%
+  summarise(#n=n(),
+            Price=mean(price, na.rm=TRUE),
+            Rating=mean(review_scores_rating, na.rm=TRUE),
+            ReviewsLastTrim=mean(number_of_reviews_ltm, na.rm=TRUE),
+            Beds=mean(beds_mean,na.rm = TRUE))%>%
+  pivot_longer(-n_log_cod, names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(n_log_cod))
+
+foo1<-host %>%
+  filter(n_log<4)%>%
+  group_by(n_log_cod)%>%
+  summarise(n=n(),
+            Price=sd(price, na.rm=TRUE)/sqrt(n),
+            Rating=sd(review_scores_rating, na.rm=TRUE)/sqrt(n),
+            ReviewsLastTrim=sd(number_of_reviews_ltm, na.rm=TRUE)/sqrt(n),
+            Beds=sd(beds_mean,na.rm = TRUE)/sqrt(n))%>%
+  pivot_longer(-n_log_cod, names_to = "Variable", values_to = "sd") %>%
+  filter(!is.na(n_log_cod) & sd!="n")
+
+foo<-foo %>% left_join(foo1, by=c("n_log_cod","Variable"))
+
+ggplot(foo, aes(x=n_log_cod, y=Value, group=Variable))+
+  geom_line(aes(color=Variable), size=2)+
+  geom_errorbar(aes(ymin=Value-sd, ymax=Value+sd), alpha=.2, width=.2)+
+  facet_wrap(vars(Variable), scale="free", ncol=2)+
+#  coord_flip()+
+  scale_color_manual(values=beigblue)+labs(x=NULL, y=NULL)+
+  theme(legend.position = "none")
+
+```
+## expérience
+
+```{r}
+ggplot(host, aes(x=year))+geom_bar()
+
+
+host$ancienneté<-ifelse(host$year<2013, "Firstcomer",
+                        ifelse(host$year>2012 & host$year<2017, "Followers",
+                               ifelse(host$year>2016 & host$year<2020, "Lastcomer" , "Newcomer")))
+
+foo<-host %>%
+  filter(n_log<4)%>%
+  group_by(ancienneté)%>%
+  summarise(#n=n(),
+            Price=mean(price, na.rm=TRUE),
+            Rating=mean(review_scores_rating, na.rm=TRUE),
+            ReviewsLastTrim=mean(number_of_reviews_ltm, na.rm=TRUE),
+            Beds=mean(beds_mean,na.rm = TRUE))%>%
+  pivot_longer(-ancienneté, names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(ancienneté))
+
+foo1<-host %>%
+  filter(n_log<4)%>%
+  group_by(ancienneté)%>%
+  summarise(n=n(),
+            Price=sd(price, na.rm=TRUE)/sqrt(n),
+            Rating=sd(review_scores_rating, na.rm=TRUE)/sqrt(n),
+            ReviewsLastTrim=sd(number_of_reviews_ltm, na.rm=TRUE)/sqrt(n),
+            Beds=sd(beds_mean,na.rm = TRUE)/sqrt(n))%>%
+  pivot_longer(-ancienneté, names_to = "Variable", values_to = "sd") %>%
+  filter(!is.na(ancienneté) & sd!="n")
+
+foo<-foo %>% left_join(foo1, by=c("ancienneté","Variable"))
+
+ggplot(foo, aes(x=ancienneté, y=Value, group=Variable))+
+  geom_line(aes(color=Variable), size=2)+
+  geom_errorbar(aes(ymin=Value-sd, ymax=Value+sd), alpha=.2, width=.2)+
+  facet_wrap(vars(Variable), scale="free", ncol=2)+
+#  coord_flip()+
+  scale_color_manual(values=beigblue)+labs(x=NULL, y=NULL)+
+  theme(legend.position = "none")
+
+
+fit<-lm(review_scores_rating ~ ancienneté*n_log_cod, host)
+anova(fit)
+summary(fit)
+cat_plot(fit, pred=n_log_cod,modx=ancienneté)
+
+
+fit<-lm(beds_mean ~ ancienneté*n_log_cod, host)
+anova(fit)
+summary(fit)
+cat_plot(fit, pred=n_log_cod,modx=ancienneté)
+
+
+```
+#lang 
+
+
+```{r}
+
+
+foo<-host %>%
+  filter(n_log<4)%>%
+  group_by(lang)%>%
+  summarise(#n=n(),
+            Price=mean(price, na.rm=TRUE),
+            Rating=mean(review_scores_rating, na.rm=TRUE),
+            ReviewsLastTrim=mean(number_of_reviews_ltm, na.rm=TRUE),
+            Beds=mean(beds_mean,na.rm = TRUE))%>%
+  pivot_longer(-lang, names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(lang))
+
+foo1<-host %>%
+  filter(n_log<4)%>%
+  group_by(lang)%>%
+  summarise(n=n(),
+            Price=sd(price, na.rm=TRUE)/sqrt(n),
+            Rating=sd(review_scores_rating, na.rm=TRUE)/sqrt(n),
+            ReviewsLastTrim=sd(number_of_reviews_ltm, na.rm=TRUE)/sqrt(n),
+            Beds=sd(beds_mean,na.rm = TRUE)/sqrt(n))%>%
+  pivot_longer(-lang, names_to = "Variable", values_to = "sd") %>%
+  filter(!is.na(lang) & sd!="n")
+
+foo<-foo %>% left_join(foo1, by=c("lang","Variable"))
+
+ggplot(foo, aes(x=lang, y=Value, group=Variable))+
+  geom_line(aes(color=Variable), size=2)+
+  geom_errorbar(aes(ymin=Value-sd, ymax=Value+sd), alpha=.2, width=.2)+
+  facet_wrap(vars(Variable), scale="free", ncol=2)+
+#  coord_flip()+
+  scale_color_manual(values=beigblue)+labs(x=NULL, y=NULL)+
+  theme(legend.position = "none")
+
+
+
+
+
+
+
+```
+
+
+# modèles
+
+
+```{r}
+ggplot(host, aes(x=number_of_reviews_ltm))+
+  geom_histogram(binwidth = 1)+
+  xlim(-1,50)
+
+fit<-lm(number_of_reviews_ltm ~ ancienneté+n_log_cod+lang, host)
+anova(fit)
+
+summary(fit)
+
+cat_plot(fit, pred=n_log_cod,modx=lang)
+
+
+mean(host$number_of_reviews_ltm)
+sd(host$number_of_reviews_ltm)
+
+
+fit_lm<-lm(number_of_reviews_ltm~n_log_cod*ancienneté+lang+review_scores_rating+beds_mean, 
+         host)
+
+fit_nbd<-glm.nb(number_of_reviews_ltm~n_log_cod*ancienneté+lang+review_scores_rating+beds_mean, 
+         host)
+
+export_summs(fit_lm, fit_nbd, scale = TRUE)
+
+#examinons les résultats variables par variables
+
+
+
+
+
+effect_plot(fit, pred=review_scores_rating, interval = TRUE)+
+  labs(x="note moyenne des avis des locataires", 
+       y="Nombre de locations au cours des 3 derniers mois")
+effect_plot(fit, pred=n_log_cod)+
+  labs(x="Nombre de logements proposés par le propriétaire", 
+       y="Nombre de locations au cours des 3 derniers mois")
+effect_plot(fit, pred=lang)+
+  labs(x="Langre de présentation du propriétaire", 
+       y="Nombre de locations au cours des 3 derniers mois")
+effect_plot(fit, pred=beds_mean, interval = TRUE)+
+  labs(x="Nombre de lits", 
+       y="Nombre de locations au cours des 3 derniers mois")+xlim(1,10)
+
+cat_plot(fit,pred=n_log_cod, modx=ancienneté, dodge.width=0)+
+  geom_line(size=2)
+
+
+ggplot(host,aes(x=year, y=number_of_reviews_ltm))+
+ # geom_point()+
+ # scale_x_log10()+
+  geom_smooth(method="gam")
+
+```
+
+```{r}
+
+
+foo<-host %>%
+  select(host_id, n)%>%
+  rename(n_log=n)%>%
+  group_by(n_log)%>%
+  summarise(n_owners=n()) %>%
+  ungroup %>%
+  arrange(desc(n_log) )%>%
+  mutate(cum_log=cumsum(n_log),
+         cum_host=cumsum(n_owners)/sum(n_owners)
+         )
+
+ggplot(foo, aes(x=cum_host, y=cum_log))+geom_point()
+
+
+sum(host$beds, na.rm=TRUE)
+```
+# Comment les hôtes se présentent ?
+
+
+un auto-description qui peut être en anglais en français ou mixte. 
+
+les thèmes qui peuvent être identifiés de manière qualitative sont
+
+* la profession
+
+* le goût du voyages et de la rencontre
+
+* le sens de l'accueil
+
+* l'efficacité : disponibilité, 
+
+L'enjeu est de les déterminer de manière plus quantitative
+
+deux approche : un seededlad
+
+ou une zero shot approach
+
