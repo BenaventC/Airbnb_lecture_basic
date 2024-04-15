@@ -1,0 +1,589 @@
+---
+title: "Facteurs de résussite"
+author: "CB"
+format: html
+editor: visual
+---
+
+L'objectif dans cette étude est d'analyser de manière corrélationnelle, les facteurs qui sont associés à des taux de réservation élevées.
+
+Nous aurons besoin d'un proxy, ce sera le nombre de review dans les 30 derniers jours. On suppose que si à t une annonce est disponible c'est qu'elle est active et qu'elle l'a été récemment. Le nombre de review mesure ainsi le succès de l’offre.
+
+# Packages et données
+
+## les packages
+
+```{r}
+library(tidyverse)
+library(ggwordcloud)
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textplots)
+#library(quanteda.corpora)
+library(gganimate)
+library(cowplot)
+library(jtools)
+library(interactions)
+library(MASS)
+
+
+beigblue<-c("#4b3b42","#9c8481","#d9c2ba","#e2cbb0","#98aeb6")
+theme_set(theme_minimal())
+```
+
+## Les données
+
+Dans cette étude on exploite les données de Airbnb Inside et en particulier le fichier listing.
+
+```{r}
+
+listings<- read_csv("listingsdec2023.csv") %>%
+  dplyr::select(-listing_url,-scrape_id,-last_scraped,-source, -picture_url,-host_url, -host_thumbnail_url,-host_picture_url) %>%
+  mutate(price_n=as.numeric(substr(price,2,nchar(price))),
+         price_u=price_n/accommodates) %>% #prix par personne
+    filter(room_type=="Entire home/apt") %>% #on se concentre sur un type de logement, celui qui est majoritaire
+    filter(host_since<ymd("2023-11-12") ) # on selectionne ceux qui ont proposé une offre plus de un mois
+
+#recodage
+
+table(listings$accommodates)
+listings<- listings %>%
+  mutate(accommodates2=ifelse(accommodates<3, "1-2 pers.",
+                              ifelse(accommodates>2 & accommodates<6, "3-5 pers.",
+                                     ifelse(accommodates>5 & accommodates<10, "6-9 pers.", "plus de 10 pers"))))
+
+listings$rating<-ifelse(is.na(listings$review_scores_rating), "ND",
+                        ifelse(listings$review_scores_rating<4,"Mauvais",
+                        ifelse(listings$review_scores_rating>3.999999 & listings$review_scores_rating<4.80,"Correct", 
+                               ifelse(listings$review_scores_rating>4.799999, "Bon", "ND"))))
+
+listings$host_response_time<-ifelse(is.na(listings$host_response_time) | listings$host_response_time=="N/A","without determination",listings$host_response_time)
+
+listings<-listings %>%
+  mutate(host_total_listings_count=ifelse(is.na(host_total_listings_count), 1, host_total_listings_count))%>%
+  mutate(nb_logs=ifelse(host_total_listings_count<5,as.character(host_total_listings_count),
+                              ifelse(host_total_listings_count>4 & host_total_listings_count<10, "de 05 à 9",
+                                     ifelse(host_total_listings_count>9 & host_total_listings_count<50, "de 10 à 50", "Plus de 50"))))
+
+
+table(listings$nb_logs)
+
+
+```
+
+# Le taux de réservation
+
+Ils sont mesurés indirectement par le nombre de commentaires qui ne peuvent être rédigé que par des locataire et dont le taux de production doit être de l'ordre des deux tiers.
+
+On a cette information à trois échelles : le nombre total dispersé sur l'étendue du temps, le nombres des trois derniers mois et celui des 30 derniers jours. Ce dernier est le plus pertinent, mais il peut être utilise d'étudier la corrélation entre l'ensemble de ces éléments et quelques variations. ( controle par le temps)
+
+L'analyse des corrélations nous montre que le nombre de review à court terme est peu corrélé au cumul historique. On se concentre sur les offre d'appartements entiers très majoritaires pour réduire un peu hétérogénéité des offres. 
+
+```{r}
+
+foo<- listings %>%
+  dplyr::select(number_of_reviews,
+                number_of_reviews_ltm, 
+                number_of_reviews_l30d) %>%
+  drop_na()
+
+r=cor(foo)
+r
+library(corrplot)
+
+corrplot(r, method = 'square', order = 'AOE', addCoef.col = 'black', tl.pos = 'd',
+         cl.pos = 'n', col = COL2('BrBG'))
+```
+
+On se focalise sur les réservation à 30 jours
+
+
+```{r}
+
+no_location<- listings %>%
+  count(foo$number_of_reviews_l30d==0)%>%
+  rename(rev=1)
+
+no_location<-no_location[1,2]/(no_location[1,2]+no_location[2,2])
+  
+print(no_location)
+
+```
+
+le résultat est clair, une majorité des offres n'a pas été louée, le taux est de ```print(no_location)```
+
+On peut améliorer en contrôlant avec la date de première publication.
+
+
+```{r}
+
+ggplot(listings, aes(x=number_of_reviews_l30d))+
+  geom_histogram(binwidth = 1)+
+  labs(title=" Distribution du nombre d'avis au cours des 30 derniers jours",
+       y=NULL,
+       x= "Nombre de réservations")+
+  scale_x_continuous(breaks = c(0,1,2, 3, 4, 5, 6, 7, 8, 9, 10), limits = c(-.5, 10))
+
+```
+
+Il est sans doute aussi simple de recoder la variable de manière binaire. L'appartement a-t-il été loué ou non. 
+
+
+```{r}
+listings<-listings %>%
+  mutate(rented=ifelse(number_of_reviews_l30d==0,0,
+                       ifelse(number_of_reviews_l30d>0, 1, NA)))
+table(listings$rented)
+
+summary(listings$rented)
+```
+
+## Les taux de reservation par arrondissement
+
+Pour tester cette idée on  examine la variabilité de cette statistique sur les arrondissements.
+
+Mais les résultats sont clairs : il y a de fortes différences d'un arrondissement à l'autre.
+
+
+```{r}
+
+foo<-listings %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(n=n(),
+            rented_mean=mean(rented, na.rm=TRUE),
+            rented_ca= 1.93*sd(rented, na.rm=TRUE)/sqrt(n-1))
+
+ggplot(foo, aes(x= reorder(neighbourhood_cleansed, rented_mean), y=rented_mean))+
+  geom_point()+
+  geom_errorbar(aes(ymin=rented_mean-rented_ca, ymax=rented_mean+rented_ca ) )+
+  coord_flip()+
+  labs(title = "Probabilité d'occupation des logements Airbnb à Paris",
+       subtitle = "En nov/dec 2023",
+       y= "probabilité",
+       x=NULL,
+       caption= "Airbnb Inside dec 2023 - IC 95%")+
+  scale_y_continuous(labels = scales::percent)
+
+ggsave("./images/effect_arr_empir.jpg", width = 27, height = 19, units = "cm")
+
+
+```
+
+## Le comportement du propriétaire
+
+### la rapidité de la réponse
+
+```{r}
+
+table(listings$host_response_time)
+
+foo<-listings %>%
+  group_by(host_response_time) %>%
+  summarise(n=n(),
+            rented_mean=mean(rented, na.rm=TRUE),
+            rented_ca= 1.93*sd(rented, na.rm=TRUE)/sqrt(n-1))
+
+ggplot(foo, aes(x= host_response_time, y=rented_mean))+
+  geom_point()+
+    geom_errorbar(aes(ymin=rented_mean-rented_ca, ymax=rented_mean+rented_ca ) )+
+  coord_flip()+
+  labs(title = "Probabilité d'occupation des logements Airbnb à Paris",
+       subtitle = "En nov/dec 2023",
+       y= "probabilité",
+       x=NULL,
+       caption= "Airbnb Inside dec 2023 - IC 95%")+
+  scale_y_continuous(labels = scales::percent)
+
+ggsave("./images/effect_time_empir.jpg", width = 27, height = 19, units = "cm")
+
+
+```
+### capacité du logement
+
+
+```{r}
+
+foo<-listings %>%
+  group_by(accommodates2) %>%
+  summarise(n=n(),
+            rented_mean=mean(rented, na.rm=TRUE),
+            rented_ca= 1.93*sd(rented, na.rm=TRUE)/sqrt(n-1))
+
+ggplot(foo, aes(x= accommodates2, y=rented_mean))+
+  geom_point()+
+    geom_errorbar(aes(ymin=rented_mean-rented_ca, ymax=rented_mean+rented_ca ) )+
+
+  geom_smooth()+
+  labs(title = "Probabilité d'occupation des logements Airbnb à Paris",
+       subtitle = "En nov/dec 2023",
+       y= "probabilité",
+       x=NULL,
+       caption= "Airbnb Inside dec 2023 - IC 95%")+
+  scale_y_continuous(labels = scales::percent)
+
+ggsave("./images/effect_accom_empir.jpg", width = 27, height = 19, units = "cm")
+
+
+```
+
+### rating
+
+```{r}
+
+ggplot(listings,aes(review_scores_rating) )+geom_histogram()+scale_x_log10()
+
+#on recode
+
+
+foo<-listings %>%
+  group_by(rating) %>%
+  summarise(n=n(),
+            rented_mean=mean(rented, na.rm=TRUE),
+            rented_ca= 1.93*sd(rented, na.rm=TRUE)/sqrt(n-1))
+
+ggplot(foo, aes(x= rating, y=rented_mean))+
+  geom_point()+
+    geom_errorbar(aes(ymin=rented_mean-rented_ca, ymax=rented_mean+rented_ca ) )+
+
+  geom_smooth()+
+  labs(title = "Probabilité d'occupation des logements Airbnb à Paris",
+       subtitle = "En nov/dec 2023",
+       y= "probabilité",
+       x=NULL,
+       caption= "Airbnb Inside dec 2023 - IC 95%")+
+  scale_y_continuous(labels = scales::percent)
+
+ggsave("./images/effect_accom_empir.jpg", width = 27, height = 19, units = "cm")
+
+
+```
+### professionnalisation
+
+elle est liée au nombre d'appartements gérés.
+
+On s'aperçoit qu'elle est associée à un plus grand taux de succès, plus on gère d'appartement plus on optimise leur occupation, cependant au delà de 50, la performance se réduit. Une échelle optimale ?
+
+```{r}
+
+
+ggplot(listings, aes(x=nb_logs))+
+  geom_bar()
+
+
+ggplot(listings, aes(x=host_listings_count, host_total_listings_count-host_listings_count))+
+  geom_point()+
+  scale_x_log10()+
+  scale_y_log10()+geom_smooth()
+
+
+foo<-listings %>%
+  group_by(nb_logs) %>%
+  summarise(n=n(),
+            rented_mean=mean(rented, na.rm=TRUE),
+            rented_ca= 1.93*sd(rented, na.rm=TRUE)/sqrt(n-1))
+
+ggplot(foo, aes(x= nb_logs, y=rented_mean))+
+  geom_point()+
+    geom_errorbar(aes(ymin=rented_mean-rented_ca, ymax=rented_mean+rented_ca ) )+
+  geom_smooth()+
+  labs(title = "Probabilité d'occupation des logements Airbnb à Paris",
+       subtitle = "En nov/dec 2023",
+       y= "probabilité",
+       x=NULL,
+       caption= "Airbnb Inside dec 2023 - IC 95%")+
+  scale_y_continuous(labels = scales::percent)
+
+ggsave("./images/effect_prof_empir.jpg", width = 27, height = 19, units = "cm")
+
+
+
+                        
+```
+
+## modèle
+
+On intègre les variables précédentes dans un modèle logit simple.
+
+
+```{r}
+table(listings$number_of_reviews_l30d)
+fit<-glm(rented~neighbourhood_cleansed+price_u*rating+accommodates2+ host_response_time , listings, family=binomial()  )
+summary(fit)
+#+           accommodates2 + + host_response_time
+#+           
+#+           
+#+           
+mean(listings$rented)
+effect_plot(fit, pred=price_u, interval = TRUE)+
+#  xlim(0, 200)+ylim(0.1, .4)+
+  labs(x="Prix par lit",
+       y="probabilité de réservation")
+
+ggsave("./images/effect_price.jpg", width = 27, height = 19, units = "cm")
+
+interact_plot(fit, pred= price_u, modx =rating)
+
+
+effect_plot(fit, pred=accommodates2, interval = TRUE)+
+#  xlim(0, 200)+ylim(0.1, .4)+
+  labs(x="accommodates2",
+       y="probabilité de réservation")
+effect_plot(fit, pred=host_response_time, interval = TRUE)+
+#  xlim(0, 200)+ylim(0.1, .4)+
+  labs(x="accommodates2",
+       y="probabilité de réservation")
+
+effect_plot(fit, pred=nb_logs, interval = TRUE)+
+#  xlim(0, 200)+ylim(0.1, .4)+
+  labs(x="nb_logs",
+       y="probabilité de réservation")
+
+```
+
+## Analyse des effets
+
+### Prix
+
+
+```{r}
+mean(listings$rented)
+effect_plot(fit, pred=price_n, interval = TRUE)+
+#  xlim(0, 200)+ylim(0.1, .4)+
+  labs(x="Prix par lit",
+       y="probabilité de réservation")
+
+ggsave("./images/effect_price.jpg", width = 27, height = 19, units = "cm")
+
+interact_plot(fit, pred= price_n, modx =rating)
+
+interact_plot(fit, pred= price_n, modx =rating)+
+  xlim(0, 200)+ # plage raisonnable
+    ylim(0, .4)+
+  labs(title="Les logements les mieux notés sont moins sensibles au prix",
+       x="Prix par guest",
+       y="Probabilité du logement d'être occupé")
+
+ggsave("./images/effect_elasticity_price.jpg", width = 27, height = 19, units = "cm")
+
+```
+
+
+```{r}
+
+
+effect_plot(fit, pred=neighbourhood_cleansed, interval = TRUE)+
+  coord_flip()+
+  labs(x=NULL,
+       y="probabilité de réservation")
+ggsave("./images/effect_arrondissement.jpg", width = 27, height = 19, units = "cm")
+
+
+effect_plot(fit, pred=rating, interval = TRUE)+
+  labs(x="Note ",
+       y="probabilité de réservation")
+effect_plot(fit, pred=accommodates2, interval = TRUE)+
+  labs(x="accommodates ",
+       y="probabilité de réservation")
+
+```
+
+### Professionnalisation de l'hôte
+
+
+```{r}
+
+effect_plot(fit, pred=nb_logs, interval = TRUE)+
+  labs(x="Nombre de logement gérés",
+       y="probabilité de réservation")
+
+ggsave("./images/effect_note.jpg", width = 27, height = 19, units = "cm")
+
+
+
+effect_plot(fit, pred=nb_logs, interval = TRUE)+
+  labs(x="host_response_time",
+       y="probabilité de réservation")
+
+
+```
+
+
+
+# cartographie
+
+L'échelle est celui des 80 quartier de paris
+
+
+```{r}
+library(sf)
+library(ggrepel)
+arr<-sf::st_read("./dataOthers/quartier_paris.shp")
+ggplot(arr)+geom_sf()+
+  geom_sf_text(aes(label = l_qu), size=1.5)
+
+ggsave("./images/map_quartier.jpeg", width = 24, height = 18, units = "cm")
+
+Map_arr<-ggplot()+
+  geom_sf(data=arr, fill="grey95")
+
+P_sf <- listings %>%
+  st_as_sf(coords = c("longitude", "latitude"))
+
+
+# map_point<-ggplot(data = P_sf) + geom_sf(data = P_sf, size=0.1, color="grey")
+
+m<-Map_arr + stat_density2d(data = listings, 
+                 aes(x = longitude, 
+                     y = latitude, 
+                     fill = ..level.., alpha = ..level..), 
+                     size = 0.1, 
+                     bins = 20, 
+                     geom = "polygon") + 
+  scale_fill_gradient(low = "salmon1", high = "darkblue")+
+  labs(title="Carte de densité des offres",
+       caption="Paris Airbnb déc 2023",
+       x=NULL,
+       y=NULL)+
+  theme(legend.position = "none")
+  
+
+m
+ggsave("./images/map_density.jpeg", width = 24, height = 18, units = "cm")
+
+```
+
+```{r}
+
+P_sf <- listings %>%
+  st_as_sf(coords = c("longitude", "latitude"))
+
+st_crs(P_sf) <- 4326 #changer le referentiel
+
+out <- st_intersection( P_sf,arr)
+out<-as.data.frame(out)
+out$n<-1
+
+Arr_stat<- out %>%
+  group_by(l_qu)%>%
+  summarise(n=n(), 
+            Expérience=mean(review_scores_rating,na.rm = TRUE), 
+            Location=mean(review_scores_location, na.rm=TRUE),
+            Propreté=mean(review_scores_cleanliness, na.rm=TRUE),
+            Prix=mean(price_n, na.rm=TRUE),
+            density=n/(surface/10000),
+            rented=mean(rented, na.rm=TRUE))
+
+Arr<-merge(arr,Arr_stat, by ="l_qu")
+
+```
+
+## densité par quartier
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=density))+
+  scale_fill_gradient(low ="lightblue", high = "darkblue")+
+  labs(title = "Densité de logements offerts au km2",
+       x=NULL,
+       y=NULL,
+       caption="Inside Airbnb dec 2023")
+  
+
+ggsave("./images/map_density2.jpeg", width = 24, height = 18, units = "cm")
+
+```
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=Prix))+
+  scale_fill_gradient(low = "white", high = "firebrick")+
+  labs(title = "Prix moyen des logements proposés",
+       x=NULL,
+       y=NULL,
+       caption="Inside Airbnb dec 2023")
+
+
+ggsave("./images/map_price.jpeg", width = 24, height = 18, units = "cm")
+
+```
+## Satisfaction
+
+La bonne expérience se fait-elle entre deux ? De bonne surprises? Mais attention les différences sont faibles et sujettes à de fortes variations aléatoires. 
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=Expérience))+ 
+  scale_fill_gradient(low = "#065f00", high = "#0efe00")+
+  labs(title = "Evaluation globale de l'expérience du séjour",
+       caption="Inside Airbnb dec 2023",
+       x=NULL,
+       y=NULL,
+       caption="Inside Airbnb dec 2023")
+  
+
+ggsave("./images/map_rating.jpeg", width = 24, height = 18, units = "cm")
+
+
+```
+## Localisation
+
+On y repère de manière aigue la chapelle et la goutte d'or, pour le reste le modèle centre périphérie se maintient avec la logique de l'hypercentre.
+
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=location))+ 
+  scale_fill_gradient(low = "grey40", high ="pink1")+
+  labs(title = "Evaluation de la qualité du lieu",
+       caption="Inside Airbnb dec 2023")
+  
+
+ggsave("./images/map_localisation.jpeg", width = 24, height = 18, units = "cm")
+
+
+```
+## propreté
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=Propreté))+ 
+  scale_fill_gradient(low = "purple", high = "skyblue")+
+  labs(title = "Evaluation de la propreté du logement",
+       caption="Inside Airbnb dec 2023",
+       x=NULL,
+       y=NULL)
+  
+
+ggsave("./images/map_clean.jpeg", width = 24, height = 18, units = "cm")
+
+
+```
+
+## rented
+
+```{r}
+
+ggplot(Arr) + 
+  geom_sf(aes(fill=rented),color="white")+ 
+  scale_fill_gradient(low = "yellow", high = "orange2")+
+  labs(title = "Evaluation du taux de location",
+       subtitle="% des logements loués au moins une fois dans le mois précédent",
+       caption="Inside Airbnb dec 2023",
+       x=NULL,
+       y=NULL)
+  
+
+ggsave("./images/map_rented.jpeg", width = 24, height = 18, units = "cm")
+
+
+```
+
+# Les chose à faire
+
+- passer à l'Iris
+- ahouter gares et monuments historiques
